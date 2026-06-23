@@ -15,6 +15,7 @@ from numpy import (
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.build import minimize_rotation_and_translation
 from ase.parallel import world, broadcast
+from time import sleep
 import warnings
 from ..structure import Structure
 from ...regression.gp.fingerprint.geometry import mic_distance
@@ -303,20 +304,80 @@ class OriginalNEB:
 
     def calculate_properties_parallel(self, **kwargs):
         "Calculate the energy and forces for each image in parallel."
+        mpi_comm = self._get_mpi4py_comm()
         # Calculate the energy and forces for each image
         for i, image in enumerate(self.images[1:-1]):
             if self.rank == (i % self.size):
                 self.real_forces[i + 1] = image.get_forces()
                 self.energies[i + 1] = image.get_potential_energy()
+        if mpi_comm is None or self.size <= 1:
+            # Broadcast the results
+            for i in range(1, self.nimages - 1):
+                root = (i - 1) % self.size
+                self.energies[i], self.real_forces[i] = broadcast(
+                    (self.energies[i], self.real_forces[i]),
+                    root=root,
+                    comm=self.comm,
+                )
+            return self.energies, self.real_forces
         # Broadcast the results
         for i in range(1, self.nimages - 1):
             root = (i - 1) % self.size
-            self.energies[i], self.real_forces[i] = broadcast(
-                (self.energies[i], self.real_forces[i]),
-                root=root,
-                comm=self.comm,
-            )
+            tag = self._parallel_property_tag(i)
+            if self.rank == root:
+                payload = (
+                    float(self.energies[i]),
+                    self.real_forces[i].copy(),
+                )
+                self._send_parallel_property_payload(tag, payload)
+            else:
+                payload = self._wait_parallel_property_payload(tag, root)
+                self.energies[i], self.real_forces[i] = payload
         return self.energies, self.real_forces
+
+    def _parallel_property_tag(self, image_index):
+        "Return a stable MPI tag for a NEB image property payload."
+        return 20000 + (image_index % 2000)
+
+    def _get_mpi4py_comm(self):
+        "Return the mpi4py communicator behind the ASE communicator."
+        try:
+            from mpi4py import MPI
+        except Exception:
+            return None
+
+        if hasattr(self.comm, "comm"):
+            return self.comm.comm
+
+        return MPI.COMM_WORLD
+
+    def _send_parallel_property_payload(self, tag, payload):
+        "Send a NEB image property payload to all other ranks."
+        mpi_comm = self._get_mpi4py_comm()
+
+        if mpi_comm is None or self.size <= 1:
+            return
+
+        requests = []
+        for dest in range(self.size):
+            if dest != self.rank:
+                requests.append(mpi_comm.isend(payload, dest=dest, tag=tag))
+
+        from mpi4py import MPI
+
+        MPI.Request.Waitall(requests)
+
+    def _wait_parallel_property_payload(self, tag, root):
+        "Wait with low CPU usage for a NEB image property payload."
+        mpi_comm = self._get_mpi4py_comm()
+
+        if mpi_comm is None or self.size <= 1:
+            return None
+
+        while not mpi_comm.Iprobe(source=root, tag=tag):
+            sleep(0.1)
+
+        return mpi_comm.recv(source=root, tag=tag)
 
     def emax(self, **kwargs):
         "Get maximum energy of the moving images."
