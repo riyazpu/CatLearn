@@ -134,9 +134,7 @@ export I_MPI_FABRICS=shm
 export FI_PROVIDER=shm
 export I_MPI_OFI_PROVIDER=shm
 
-export ASE_VASP_COMMAND="env I_MPI_FABRICS=shm FI_PROVIDER=shm \
-I_MPI_OFI_PROVIDER=shm I_MPI_WAIT_MODE=1 I_MPI_SPIN_COUNT=0 \
-mpirun -np ${VASP_NTASKS} vasp_std"
+export ASE_VASP_COMMAND="mpirun -np ${VASP_NTASKS} vasp_std"
 
 srun --unbuffered -n ${MLNEB_NTASKS} --cpu-bind=cores python3 -u -m mpi4py run_mlneb_restart.py
 ```
