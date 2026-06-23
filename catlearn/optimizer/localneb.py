@@ -2,6 +2,7 @@ from .local import LocalOptimizer
 from ase.parallel import world, broadcast
 from ase.optimize import FIRE
 from numpy import asarray
+from time import sleep
 from ..structures.neb import OriginalNEB
 
 
@@ -118,6 +119,7 @@ class LocalNEB(LocalOptimizer):
         **kwargs,
     ):
         "Get the structures in parallel."
+        mpi_comm = self._get_mpi4py_comm()
         # Get the initial structure
         structures = [
             self.copy_atoms(
@@ -136,7 +138,15 @@ class LocalNEB(LocalOptimizer):
                     allow_calculation=allow_calculation,
                     **kwargs,
                 )
-            structures.append(broadcast(image, root=root, comm=self.comm))
+            if mpi_comm is None or self.size <= 1:
+                image = broadcast(image, root=root, comm=self.comm)
+            elif self.rank == root:
+                tag = self._parallel_structure_tag(i)
+                self._send_parallel_structure_payload(tag, image)
+            else:
+                tag = self._parallel_structure_tag(i)
+                image = self._wait_parallel_structure_payload(tag, root)
+            structures.append(image)
         # Get the final structure
         structures.append(
             self.copy_atoms(
@@ -146,6 +156,50 @@ class LocalNEB(LocalOptimizer):
             )
         )
         return structures
+
+    def _parallel_structure_tag(self, image_index):
+        "Return a stable MPI tag for a copied NEB image payload."
+        return 22000 + (image_index % 2000)
+
+    def _get_mpi4py_comm(self):
+        "Return the mpi4py communicator behind the ASE communicator."
+        try:
+            from mpi4py import MPI
+        except Exception:
+            return None
+
+        if hasattr(self.comm, "comm"):
+            return self.comm.comm
+
+        return MPI.COMM_WORLD
+
+    def _send_parallel_structure_payload(self, tag, payload):
+        "Send a copied NEB image payload to all other ranks."
+        mpi_comm = self._get_mpi4py_comm()
+
+        if mpi_comm is None or self.size <= 1:
+            return
+
+        requests = []
+        for dest in range(self.size):
+            if dest != self.rank:
+                requests.append(mpi_comm.isend(payload, dest=dest, tag=tag))
+
+        from mpi4py import MPI
+
+        MPI.Request.Waitall(requests)
+
+    def _wait_parallel_structure_payload(self, tag, root):
+        "Wait with low CPU usage for a copied NEB image payload."
+        mpi_comm = self._get_mpi4py_comm()
+
+        if mpi_comm is None or self.size <= 1:
+            return None
+
+        while not mpi_comm.Iprobe(source=root, tag=tag):
+            sleep(0.1)
+
+        return mpi_comm.recv(source=root, tag=tag)
 
     def get_candidates(self, **kwargs):
         return self.optimizable.images[1:-1]

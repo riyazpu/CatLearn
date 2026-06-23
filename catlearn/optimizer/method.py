@@ -1,6 +1,7 @@
 from numpy import einsum, max as max_, sqrt
 from numpy.random import default_rng, Generator, RandomState
 from ase.parallel import world, broadcast
+from time import sleep
 import warnings
 from ..regression.gp.calculator.copy_atoms import (
     copy_atoms,
@@ -161,7 +162,11 @@ class OptimizerMethod:
                 )
             # Broadcast the atoms instance to all processes
             if is_parallel:
-                atoms_new = broadcast(atoms_new, root=root, comm=self.comm)
+                atoms_new = self._share_parallel_payload(
+                    tag=self._parallel_payload_tag(0, i),
+                    root=root,
+                    payload=atoms_new,
+                )
             candidates_copy.append(atoms_new)
         return candidates_copy
 
@@ -258,7 +263,11 @@ class OptimizerMethod:
             e = None
             if self.rank == root:
                 e = atoms.get_potential_energy(**kwargs)
-            e = broadcast(e, root=root, comm=self.comm)
+            e = self._share_parallel_payload(
+                tag=self._parallel_payload_tag(1, i),
+                root=root,
+                payload=e,
+            )
             energy.append(e)
         return energy
 
@@ -299,7 +308,11 @@ class OptimizerMethod:
             f = None
             if self.rank == root:
                 f = atoms.get_forces(**kwargs)
-            f = broadcast(f, root=root, comm=self.comm)
+            f = self._share_parallel_payload(
+                tag=self._parallel_payload_tag(2, i),
+                root=root,
+                payload=f,
+            )
             forces.append(f)
         return forces
 
@@ -352,6 +365,9 @@ class OptimizerMethod:
                 )
                 for atoms in self.get_candidates()
             ]
+        uncertainty = [
+            self._scalar_uncertainty(unc) for unc in uncertainty
+        ]
         if not per_candidate:
             uncertainty = max_(uncertainty)
         return uncertainty
@@ -378,7 +394,11 @@ class OptimizerMethod:
                         atoms=atoms,
                         **kwargs,
                     )
-            unc = broadcast(unc, root=root, comm=self.comm)
+            unc = self._share_parallel_payload(
+                tag=self._parallel_payload_tag(3, i),
+                root=root,
+                payload=unc,
+            )
             uncertainty.append(unc)
         return uncertainty
 
@@ -423,7 +443,11 @@ class OptimizerMethod:
                     )
                 # Broadcast the property to all processes
                 if is_parallel:
-                    result = broadcast(result, root=root, comm=self.comm)
+                    result = self._share_parallel_payload(
+                        tag=self._parallel_payload_tag(4, i),
+                        root=root,
+                        payload=result,
+                    )
                 output.append(result)
         else:
             # Get the property of the optimizable instance
@@ -476,7 +500,11 @@ class OptimizerMethod:
                         )
                     # Broadcast the property to all processes
                     if is_parallel:
-                        result = broadcast(result, root=root, comm=self.comm)
+                        result = self._share_parallel_payload(
+                            tag=self._parallel_payload_tag(5, i),
+                            root=root,
+                            payload=result,
+                        )
                     results[name].append(result)
         else:
             # Get the properties of the optimizable instance
@@ -529,6 +557,53 @@ class OptimizerMethod:
                 **kwargs,
             )
         return result
+
+    def _parallel_payload_tag(self, kind, index):
+        "Return a stable MPI tag for optimizer per-candidate payloads."
+        return 10000 + 2000 * kind + (index % 2000)
+
+    def _get_mpi4py_comm(self):
+        "Return the mpi4py communicator behind the ASE communicator."
+        try:
+            from mpi4py import MPI
+        except Exception:
+            return None
+
+        if hasattr(self.comm, "comm"):
+            return self.comm.comm
+
+        return MPI.COMM_WORLD
+
+    def _share_parallel_payload(self, tag, root, payload):
+        "Share a per-candidate payload without ASE's collective broadcast."
+        mpi_comm = self._get_mpi4py_comm()
+
+        if mpi_comm is None or self.size <= 1:
+            return broadcast(payload, root=root, comm=self.comm)
+
+        if self.rank == root:
+            requests = []
+            for dest in range(self.size):
+                if dest != root:
+                    requests.append(mpi_comm.isend(payload, dest=dest, tag=tag))
+
+            from mpi4py import MPI
+
+            MPI.Request.Waitall(requests)
+            return payload
+
+        while not mpi_comm.Iprobe(source=root, tag=tag):
+            sleep(0.1)
+
+        return mpi_comm.recv(source=root, tag=tag)
+
+    @staticmethod
+    def _scalar_uncertainty(uncertainty):
+        "Return a scalar uncertainty even if the calculator returns an array."
+        try:
+            return float(uncertainty)
+        except (TypeError, ValueError):
+            return float(max_(uncertainty))
 
     def is_within_dtrust(self, per_candidate=False, dtrust=2.0, **kwargs):
         """
