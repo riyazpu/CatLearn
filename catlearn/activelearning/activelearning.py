@@ -12,8 +12,10 @@ from numpy.random import default_rng, Generator, RandomState
 from ase.io import read
 from ase.parallel import world, broadcast
 from ase.io.trajectory import TrajectoryWriter
+from contextlib import contextmanager
 import datetime
-from time import time
+from time import time, sleep
+import os
 import warnings
 from ..regression.gp.calculator import BOCalculator, compare_atoms, copy_atoms
 from ..regression.gp.means import Prior_max
@@ -35,6 +37,7 @@ class ActiveLearning:
         is_minimization=True,
         save_memory=False,
         parallel_run=False,
+        parallel_eval=None,
         copy_calc=False,
         verbose=True,
         apply_constraint=True,
@@ -249,6 +252,7 @@ class ActiveLearning:
             data_tol=data_tol,
             save_memory=save_memory,
             parallel_run=parallel_run,
+            parallel_eval=parallel_eval,
             copy_calc=copy_calc,
             verbose=verbose,
             apply_constraint=apply_constraint,
@@ -333,8 +337,11 @@ class ActiveLearning:
                 )
                 break
             # Train and optimize ML model
+            self.message_system("Starting ML model training.")
             self.train_mlmodel()
+            self.message_system("Finished ML model training.")
             # Run the method
+            self.message_system("Starting ML optimization on surrogate surface.")
             candidates, method_converged = self.find_next_candidates(
                 fmax=self.scale_fmax * fmax,
                 step=step,
@@ -342,8 +349,11 @@ class ActiveLearning:
                 max_unc=max_unc,
                 dtrust=dtrust,
             )
+            self.message_system("Finished ML optimization on surrogate surface.")
             # Evaluate candidate
+            self.message_system("Starting true calculator evaluation.")
             self.evaluate_candidates(candidates)
+            self.message_system("Finished true calculator evaluation.")
             # Print the results for this iteration
             self.print_statement()
             # Check for convergence
@@ -836,6 +846,7 @@ class ActiveLearning:
         is_minimization=None,
         save_memory=None,
         parallel_run=None,
+        parallel_eval=None,
         copy_calc=None,
         verbose=None,
         apply_constraint=None,
@@ -1035,6 +1046,18 @@ class ActiveLearning:
                     "The save_memory and parallel_run can not "
                     "be True at the same time!"
                 )
+        if parallel_eval is not None:
+            self.parallel_eval = bool(parallel_eval)
+            self._parallel_eval_user_set = True
+        elif not hasattr(self, "parallel_eval") or (
+            ase_calc is not None
+            and not getattr(self, "_parallel_eval_user_set", False)
+        ):
+            calc_for_eval = ase_calc if ase_calc is not None else self.ase_calc
+            self.parallel_eval = not self.is_serial_external_calculator(
+                calc_for_eval
+            )
+            self._parallel_eval_user_set = False
         # Set the verbose
         if verbose is not None:
             # Whether to have the full output
@@ -1415,12 +1438,9 @@ class ActiveLearning:
         self.eval_time = time()
         # Calculate the energies and forces
         self.message_system("Performing evaluation.", end="\r")
-        forces = self.candidate.get_forces(
-            apply_constraint=self.apply_constraint
-        )
-        self.energy_true = self.candidate.get_potential_energy(
-            force_consistent=self.force_consistent
-        )
+        evaluated = self.evaluate_with_ase_calc()
+        forces = evaluated["forces"]
+        self.energy_true = evaluated["energy"]
         self.message_system("Single-point calculation finished.")
         # Store the evaluation time
         self.eval_time = time() - self.eval_time
@@ -1448,12 +1468,203 @@ class ActiveLearning:
         self.make_summary_table()
         return
 
+    def evaluate_with_ase_calc(self, **kwargs):
+        """
+        Evaluate the current candidate with the true ASE calculator.
+
+        For external calculators such as VASP, set ``parallel_eval=False`` so
+        only rank 0 launches the external calculation. Non-root ranks wait in
+        a low-CPU MPI probe loop until rank 0 finishes, then the evaluated
+        Atoms, energy, and forces are sent to all ranks.
+        """
+        if self.parallel_eval:
+            return self._evaluate_with_ase_calc_on_this_rank()
+
+        evaluated = None
+        error = None
+        tag = 31000 + (self.steps % 500)
+
+        if self.rank == 0:
+            try:
+                evaluated = self._evaluate_with_ase_calc_on_this_rank()
+            except Exception as exc:
+                error = repr(exc)
+            payload = {"evaluated": evaluated, "error": error}
+            self._send_parallel_eval_payload(tag, payload)
+        else:
+            payload = self._wait_parallel_eval_payload(tag)
+
+        if payload["error"] is not None:
+            raise RuntimeError(
+                "ASE calculator evaluation failed on rank 0: "
+                f"{payload['error']}"
+            )
+
+        evaluated = payload["evaluated"]
+        self.candidate = evaluated["atoms"]
+        return evaluated
+
+    def _get_mpi4py_comm(self):
+        "Return the mpi4py communicator behind the ASE communicator."
+        try:
+            from mpi4py import MPI
+        except Exception:
+            return None
+
+        if hasattr(self.comm, "comm"):
+            return self.comm.comm
+
+        return MPI.COMM_WORLD
+
+    def _send_parallel_eval_payload(self, tag, payload):
+        "Send the completed external-evaluation payload to non-root ranks."
+        mpi_comm = self._get_mpi4py_comm()
+
+        if mpi_comm is None or self.size <= 1:
+            return
+
+        requests = []
+        for dest in range(1, self.size):
+            requests.append(mpi_comm.isend(payload, dest=dest, tag=tag))
+
+        from mpi4py import MPI
+
+        MPI.Request.Waitall(requests)
+
+    def _wait_parallel_eval_payload(self, tag):
+        "Wait with low CPU usage for the external-evaluation payload."
+        mpi_comm = self._get_mpi4py_comm()
+
+        if mpi_comm is None or self.size <= 1:
+            return None
+
+        while not mpi_comm.Iprobe(source=0, tag=tag):
+            sleep(1.0)
+
+        return mpi_comm.recv(source=0, tag=tag)
+
+    def _evaluate_with_ase_calc_on_this_rank(self):
+        "Evaluate the current candidate on the calling rank."
+        self.candidate.calc = self.ase_calc
+        with self._disable_ase_parallel_io():
+            forces = self.candidate.get_forces(
+                apply_constraint=self.apply_constraint
+            )
+            energy = self.candidate.get_potential_energy(
+                force_consistent=self.force_consistent
+            )
+        return {
+            "atoms": copy_atoms(
+                self.candidate,
+                results=self.candidate.calc.results,
+            ),
+            "energy": energy,
+            "forces": forces,
+        }
+
+    @contextmanager
+    def _disable_ase_parallel_io(self):
+        """
+        Force ASE's internal IO helpers to run serially on this rank.
+
+        ASE's VASP calculator reads vasprun.xml through ASE IO, which normally
+        broadcasts parsed objects with ASE's global communicator. When
+        ``parallel_eval=False``, only rank 0 evaluates VASP and the other ranks
+        wait outside ASE, so that internal ASE broadcast would otherwise hang.
+        """
+        try:
+            import ase.parallel as ase_parallel
+        except Exception:
+            yield
+            return
+
+        old_broadcast = getattr(ase_parallel, "broadcast", None)
+        old_world = getattr(ase_parallel, "world", None)
+
+        class SerialWorld:
+            rank = 0
+            size = 1
+
+            def broadcast(self, obj, root=0):
+                return obj
+
+            def barrier(self):
+                return None
+
+            def sum(self, value, root=-1):
+                return value
+
+            def product(self, value, root=-1):
+                return value
+
+            def max(self, value, root=-1):
+                return value
+
+            def min(self, value, root=-1):
+                return value
+
+        def serial_broadcast(obj, root=0, comm=None):
+            return obj
+
+        try:
+            ase_parallel.broadcast = serial_broadcast
+            if hasattr(ase_parallel, "DummyMPI"):
+                ase_parallel.world = ase_parallel.DummyMPI()
+            else:
+                ase_parallel.world = SerialWorld()
+            yield
+        finally:
+            if old_broadcast is not None:
+                ase_parallel.broadcast = old_broadcast
+            if old_world is not None:
+                ase_parallel.world = old_world
+
+    def get_parallel_eval_wait_file(self):
+        "Return the shared wait file used while rank 0 evaluates externally."
+        if not hasattr(self, "_parallel_eval_wait_dir"):
+            self._parallel_eval_wait_dir = os.getcwd()
+
+        return os.path.join(
+            self._parallel_eval_wait_dir,
+            ".catlearn_parallel_eval_{}.done".format(self.steps),
+        )
+
+    @staticmethod
+    def is_serial_external_calculator(calculator):
+        """
+        Return True for calculators that should not be launched by every
+        Python MPI rank.
+
+        ASE's VASP calculator starts an external VASP executable, so CatLearn
+        should let VASP handle parallelization and evaluate only on rank 0.
+        """
+        if calculator is None:
+            return False
+
+        cls = calculator.__class__
+        tokens = [
+            getattr(calculator, "name", ""),
+            cls.__name__,
+            cls.__module__,
+        ]
+        return any("vasp" in str(token).lower() for token in tokens)
+
     def update_candidate(self, candidate, dtol=1e-8, **kwargs):
         "Update the evaluated candidate with given candidate."
-        # Broadcast the system to all cpus
-        if self.rank == 0:
-            candidate = candidate.copy()
-        candidate = broadcast(candidate, root=0, comm=self.comm)
+        mpi_comm = self._get_mpi4py_comm()
+        tag = 30500 + (self.steps % 500)
+
+        if mpi_comm is not None and self.size > 1:
+            if self.rank == 0:
+                candidate = candidate.copy()
+                self._send_parallel_eval_payload(tag, candidate)
+            else:
+                candidate = self._wait_parallel_eval_payload(tag)
+        else:
+            # Broadcast the system to all cpus
+            if self.rank == 0:
+                candidate = candidate.copy()
+            candidate = broadcast(candidate, root=0, comm=self.comm)
         # Update the evaluated candidate with given candidate
         # Set positions
         self.candidate.set_positions(candidate.get_positions())
@@ -1497,6 +1708,29 @@ class ActiveLearning:
             self.pred_energies = self.pred_energies[1:]
             self.unc = self.uncertainties[0]
             self.uncertainties = self.uncertainties[1:]
+
+        mpi_comm = self._get_mpi4py_comm()
+        if mpi_comm is not None and self.size > 1:
+            tag = 30600 + (self.steps % 500)
+            if self.rank == 0:
+                payload = {
+                    "energy_pred": self._scalar_prediction(
+                        self.energy_pred
+                    ),
+                    "unc": self._scalar_prediction(self.unc),
+                    "pred_energies": self.pred_energies,
+                    "uncertainties": self.uncertainties,
+                }
+                self._send_parallel_eval_payload(tag, payload)
+            else:
+                payload = self._wait_parallel_eval_payload(tag)
+
+            self.energy_pred = payload["energy_pred"]
+            self.unc = payload["unc"]
+            self.pred_energies = payload["pred_energies"]
+            self.uncertainties = payload["uncertainties"]
+            return self
+
         # Broadcast the predictions
         self.energy_pred = broadcast(self.energy_pred, root=0, comm=self.comm)
         self.unc = broadcast(self.unc, root=0, comm=self.comm)
@@ -1510,7 +1744,22 @@ class ActiveLearning:
             root=0,
             comm=self.comm,
         )
+        self.energy_pred = self._scalar_prediction(self.energy_pred)
+        self.unc = self._scalar_prediction(self.unc)
         return self
+
+    @staticmethod
+    def _scalar_prediction(value):
+        "Return scalar prediction values when numpy gives length-1 arrays."
+        if isinstance(value, tuple) and len(value) == 1:
+            value = value[0]
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            array_value = asarray(value).reshape(-1)
+            if len(array_value) == 1:
+                return float(array_value[0])
+            return value
 
     def extra_initial_data(self, **kwargs):
         """
@@ -1689,7 +1938,15 @@ class ActiveLearning:
                 if e_dif > uci:
                     converged = False
         # Broadcast convergence statement if MPI is used
-        converged = broadcast(converged, root=0, comm=self.comm)
+        mpi_comm = self._get_mpi4py_comm()
+        if mpi_comm is not None and self.size > 1:
+            tag = 30700 + (self.steps % 500)
+            if self.rank == 0:
+                self._send_parallel_eval_payload(tag, bool(converged))
+            else:
+                converged = self._wait_parallel_eval_payload(tag)
+        else:
+            converged = broadcast(converged, root=0, comm=self.comm)
         # Check the convergence
         if converged:
             self.copy_best_structures()
@@ -1715,10 +1972,47 @@ class ActiveLearning:
         Returns:
             list of ASE Atoms objects: The best structures.
         """
-        # Check if the method is running in parallel
-        if not self.parallel_run and self.rank != 0:
+        if self.parallel_run:
+            tag = 31500 + (self.steps % 500)
+            payload = None
+
+            if self.rank == 0:
+                state = []
+                try:
+                    state = self._set_active_method_parallel(False)
+                    best_structures = self.get_structures(
+                        get_all=get_all,
+                        properties=properties,
+                        allow_calculation=allow_calculation,
+                        **kwargs,
+                    )
+                    payload = {
+                        "best_structures": best_structures,
+                        "error": None,
+                    }
+                except Exception as exc:
+                    payload = {
+                        "best_structures": None,
+                        "error": repr(exc),
+                    }
+                finally:
+                    self._restore_parallel_state(state)
+                    self._send_parallel_eval_payload(tag, payload)
+            else:
+                payload = self._wait_parallel_eval_payload(tag)
+
+            if payload["error"] is not None:
+                raise RuntimeError(
+                    "Copying best structures failed on rank 0: "
+                    f"{payload['error']}"
+                )
+
+            self.best_structures = payload["best_structures"]
             return self.best_structures
-        # Get the best structures with calculated properties
+
+        if self.rank != 0:
+            return self.best_structures
+
         self.best_structures = self.get_structures(
             get_all=get_all,
             properties=properties,
@@ -1726,6 +2020,33 @@ class ActiveLearning:
             **kwargs,
         )
         return self.best_structures
+
+    def _set_active_method_parallel(self, parallel):
+        "Temporarily set the active optimizer copy path to serial/parallel."
+        state = []
+        methods = [self.method]
+
+        active_method = getattr(self.method, "method", None)
+        if active_method is not None:
+            methods.append(active_method)
+
+        for method in methods:
+            if hasattr(method, "parallel_run"):
+                state.append((method, "parallel_run", method.parallel_run))
+                method.parallel_run = parallel
+
+            optimizable = getattr(method, "optimizable", None)
+            if optimizable is not None and hasattr(optimizable, "parallel"):
+                state.append((optimizable, "parallel", optimizable.parallel))
+                optimizable.parallel = parallel
+
+        return state
+
+    @staticmethod
+    def _restore_parallel_state(state):
+        "Restore optimizer parallel flags after a temporary serial copy."
+        for obj, name, value in reversed(state):
+            setattr(obj, name, value)
 
     def get_best_structures(self):
         "Get the best structures."
@@ -2107,6 +2428,7 @@ class ActiveLearning:
             is_minimization=self.is_minimization,
             save_memory=self.save_memory,
             parallel_run=self.parallel_run,
+            parallel_eval=self.parallel_eval,
             copy_calc=self.copy_calc,
             verbose=self.verbose,
             apply_constraint=self.apply_constraint,
